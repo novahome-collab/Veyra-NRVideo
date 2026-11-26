@@ -18,21 +18,26 @@ constexpr const wchar_t* ngxFailureHint(uint64_t result) {
 inline bool disableUnsupportedNvidiaEffects(EnhancementSettings& settings,bool nvidia,bool amdNr=false){
     const auto before=settings;
     settings.sr=settings.sr&&videoSrRunsOn(settings.videoSrQuality,nvidia,amdNr);
-    if(nvidia)return settings.sr!=before.sr;
+    if(nvidia){
+        if(!frameGenerationRunsOn(settings.frameGenerationBackend,true,false))settings.multiplier=1;
+        return settings!=before;
+    }
     if(!amdNr)settings.nr=false;
-    // NVOF does not exist on these adapters; NR motion uses AMD FidelityFX flow.
-    if(amdNr&&settings.nr&&settings.opticalFlowBackend==OpticalFlowBackend::Nvidia)
-        settings.opticalFlowBackend=OpticalFlowBackend::AmdFidelityFx;
     settings.videoHdr.enabled=false;
-    if(settings.frameGenerationBackend==FrameGenerationBackend::Dlss)settings.multiplier=1;
+    if(!frameGenerationRunsOn(settings.frameGenerationBackend,false,amdNr))settings.multiplier=1;
+    // NVOF does not exist on AMD or Intel adapters; move active NR/FG flow consumers to FidelityFX flow.
+    // (Temporal SR-only fallback is also enforced in EnhanceGraph::initialize for all non-NVIDIA adapters.)
+    const bool needsFlow=(amdNr&&settings.nr)||
+        (settings.multiplier>1&&motionUsesFlow(settings.fgMotion,settings.frameGenerationBackend));
+    if(needsFlow&&settings.opticalFlowBackend==OpticalFlowBackend::Nvidia)
+        settings.opticalFlowBackend=OpticalFlowBackend::AmdFidelityFx;
     return settings!=before;
 }
-// A stage that only an NVIDIA adapter can run is still requested: NR outside
-// the AMD runtime, unsupported SR, and frame generation other than the
-// cross-vendor XeSS/FSR providers.
+// A stage that the active non-NVIDIA adapter cannot run is still requested:
+// NR outside the AMD runtime, unsupported SR, and NVIDIA/AMD-exclusive FG.
 inline bool nvidiaOnlyStagesRequested(bool nr,bool sr,bool fg,const EnhancementSettings& settings,bool amdNr){
     return (nr&&!amdNr)||(sr&&!videoSrRunsOn(settings.videoSrQuality,false,amdNr))||
-        (fg&&!crossVendorFrameGeneration(settings.frameGenerationBackend));
+        (fg&&!frameGenerationRunsOn(settings.frameGenerationBackend,false,amdNr));
 }
 inline const wchar_t* backendFailureName(FailedBackend backend) {
     switch(backend){

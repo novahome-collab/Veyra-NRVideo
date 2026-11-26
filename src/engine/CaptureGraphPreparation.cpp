@@ -75,6 +75,7 @@ bool CaptureGraphPreparation::start(gfx::D3D12DeviceContext& ctx,const gfx::Comm
                     r->graph=std::make_unique<pipeline::EnhanceGraph>(ctx,r->ring,&core);
                     if(stop||!r->graph->initialize(desc))r->failure=r->graph->failedBackend();
                     else if(r->graph->fsrSrRequested()&&!r->graph->fsrSrEnabled())r->failure=FailedBackend::Sr;
+                    else if(r->graph->xessSrRequested()&&!r->graph->xessSrEnabled())r->failure=FailedBackend::Sr;
                     else if(r->graph->fsrEnabled()&&!r->graph->fsrActive())r->failure=FailedBackend::Fg;
                     else if(!stop&&r->graph->createViews()){
                         const auto warmup=Clock::now();

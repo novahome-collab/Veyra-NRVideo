@@ -138,6 +138,22 @@ int main(){
         s.videoSrQuality=2;
         check(engine::nvidiaOnlyStagesRequested(false,s.sr,false,s,true),"RTX Video SR is an NVIDIA-only stage");
         check(engine::nvidiaOnlyStagesRequested(true,false,false,s,false)&&!engine::nvidiaOnlyStagesRequested(true,false,false,s,true),"NR is NVIDIA-only except on the AMD runtime");
+        // Intel Arc A730M contract: XeSS SR/FG, FSR 3.1, NIS, ANR, RIFE run; NVIDIA/AMD-exclusive stages disable and flow falls back to FidelityFX.
+        s=engine::EnhancementSettings{};s.sr=true;s.videoSrQuality=engine::kVideoSrXess;s.multiplier=2;
+        s.frameGenerationBackend=engine::FrameGenerationBackend::Fsr;s.opticalFlowBackend=engine::OpticalFlowBackend::Nvidia;
+        check(engine::disableUnsupportedNvidiaEffects(s,false,false)&&s.sr&&s.multiplier==2&&
+              s.opticalFlowBackend==engine::OpticalFlowBackend::AmdFidelityFx,"Intel normalization keeps XeSS SR and FSR FG and moves NVOF to FidelityFX");
+        s=engine::EnhancementSettings{};s.multiplier=2;s.frameGenerationBackend=engine::FrameGenerationBackend::AmdFrc;
+        check(engine::disableUnsupportedNvidiaEffects(s,false,false)&&s.multiplier==1,"Intel normalization disables AMD-only FRC");
+        s=engine::EnhancementSettings{};s.multiplier=2;s.frameGenerationBackend=engine::FrameGenerationBackend::Fsr4;
+        check(engine::disableUnsupportedNvidiaEffects(s,false,false)&&s.multiplier==1,"Intel normalization disables AMD-only FSR4");
+        check(engine::defaultFrameGenerationBackend(0x8086,false,true)==engine::FrameGenerationBackend::XeSS,"Intel Arc defaults to XeSS FG");
+        check(engine::defaultFrameGenerationBackend(0x8086,false,false)==engine::FrameGenerationBackend::Fsr,"Non-Arc Intel defaults to FSR 3.1");
+        check(engine::exportFrameGenerationSupported(engine::FrameGenerationBackend::Fsr,false,false)&&
+              engine::exportFrameGenerationSupported(engine::FrameGenerationBackend::Rife,false,false)&&
+              !engine::exportFrameGenerationSupported(engine::FrameGenerationBackend::AmdFrc,false,false)&&
+              !engine::exportFrameGenerationSupported(engine::FrameGenerationBackend::Fsr4,false,false),
+              "Intel export FG allows cross-vendor graph backends and rejects AMD-only backends");
     }
     {
         engine::EnhancementSettings requested;requested.nr=requested.sr=true;requested.multiplier=2;requested.audioOffsetMs=37;

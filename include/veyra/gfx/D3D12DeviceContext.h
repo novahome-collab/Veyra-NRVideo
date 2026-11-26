@@ -24,10 +24,17 @@ struct AdapterInfo {
     std::string luidString;              // "0xHigh:0xLow"
     uint64_t dedicatedVideoMemoryBytes = 0;
     bool isNvidia = false;
+    bool isIntel = false;
+    bool isIntelArc = false;
     bool isSoftware = false;
     std::wstring driverVersion;          // registry DisplayVersion when found
     std::wstring driverVersionSource;    // "registry" or "dxgi-raw"
 };
+
+// Intel discrete Arc GPU detection (Alchemist ACM-G10/G11/G12 including Arc A730M 0x5691,
+// Battlemage BMG-G21, and name match for newer Arc generations).
+bool isIntelArcDevice(uint32_t vendorId, uint32_t deviceId, std::wstring_view description);
+bool isIntegratedLowVramIntelAdapter(const DXGI_ADAPTER_DESC1& desc);
 
 // Compute adapter chosen in 设置 -> "同时用这块显卡运算" (0 = default order,
 // highest-performance hardware adapter first). A device created without

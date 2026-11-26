@@ -138,23 +138,28 @@ bool exportVideo(const std::wstring& input,const std::wstring& output,PlayerOpti
                 L"当前显卡不能使用所选超分，本次导出关闭超分";
         }
         if(!nvidiaFeatures&&srAvailable&&options.settings.videoSrQuality==kVideoSrFsr)fgNote+=fgNote.empty()?L"本次导出使用 AMD FSR 超分":L"；本次导出使用 AMD FSR 超分";
+        if(!nvidiaFeatures&&srAvailable&&options.settings.videoSrQuality==kVideoSrXess)fgNote+=fgNote.empty()?L"本次导出使用 Intel XeSS 超分":L"；本次导出使用 Intel XeSS 超分";
         gd.runtimeAbsPath=runtime::localRuntimeDirectory().wstring();
         // Keep the requested multiplier. Changing it after initialization fails
         // would produce a successful-looking file with different settings.
         bool graphReady=false,fgFailure=false;
         auto startGraph=[&](bool fg,uint32_t multiplier){
             gd.enableFg=fg;gd.fgMultiplier=fg?multiplier:1;
-            if(graph.initialize(gd)&&graph.createViews()){graphReady=true;return;}
+            if(graph.initialize(gd)&&graph.createViews()&&
+               (!graph.fsrSrRequested()||graph.fsrSrEnabled())&&
+               (!graph.xessSrRequested()||graph.xessSrEnabled())){graphReady=true;return;}
             if(graph.failedBackend()==FailedBackend::VideoHdr||(gd.convertVideoHdr()&&!gd.enableNr&&!gd.enableSr&&!gd.enableFg&&graph.failedBackend()==FailedBackend::NgxCore)){
                 graph.shutdown();
                 gd.videoHdr.enabled=false;gd.hdrOutput=gd.hdrInput;
                 fgNote+=L"；RTX Video HDR 初始化失败，本次保留 SDR（错误码见日志）";
-                if(graph.initialize(gd)&&graph.createViews()){graphReady=true;return;}
+                if(graph.initialize(gd)&&graph.createViews()&&
+                   (!graph.fsrSrRequested()||graph.fsrSrEnabled())&&
+                   (!graph.xessSrRequested()||graph.xessSrEnabled())){graphReady=true;return;}
             }
             fgFailure=graph.failedBackend()==FailedBackend::Fg;
             graph.shutdown();
         };
-        if(options.fg&&!exportFrameGenerationSupported(options.settings.frameGenerationBackend,nvidiaFeatures)){
+        if(options.fg&&!exportFrameGenerationSupported(options.settings.frameGenerationBackend,nvidiaFeatures,amdAdapter)){
             failureReason=L"当前导出设备不能执行所选补帧后端，未替换后端或降低倍率";break;
         }
         if(options.fg){

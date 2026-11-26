@@ -63,9 +63,19 @@ def checked_copy(source, stage, name, identity=None):
     shutil.copyfile(source, target)
 
 
+FLAVORS = ('NVIDIA', 'AMD', 'INTEL')
+
+
 def keep_common(name, flavor):
     if flavor == 'NVIDIA':
         return not name.startswith('runtime/amd-nr/')
+    if flavor == 'INTEL':
+        return not name.startswith(('runtime/amd-nr/', 'runtime/amd-nr-rdna3/',
+                                    'runtime/experimental/nvngx', 'runtime/experimental/nr-',
+                                    'runtime/experimental/fallback-dlssg', 'runtime/experimental/dlssg-kernels/',
+                                    'runtime/experimental/dlssg-lite/',
+                                    'runtime/nvidia-vfg/', 'runtime/config/', 'licenses/nvidia-vfg/',
+                                    'licenses/vfg-samples/'))
     return not name.startswith(('runtime/experimental/nvngx', 'runtime/experimental/nr-',
                                 'runtime/experimental/fallback-dlssg', 'runtime/experimental/dlssg-kernels/',
                                 'runtime/experimental/dlssg-lite/',
@@ -79,6 +89,12 @@ def check_vendor(stage, flavor):
         assert not any(n.startswith('runtime/amd-nr/') for n in names)
         assert {Path(n).name for n in names if n.startswith('runtime_local/amd/fidelityfx/')} == {'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll'}
         assert {Path(n).name for n in names if n.startswith('runtime/nvidia-vfg/')} == VFG_KEEP
+    elif flavor == 'INTEL':
+        assert not any(n.startswith(('runtime/amd-nr/', 'runtime/amd-nr-rdna3/',
+                                     'runtime/nvidia-vfg/', 'runtime/experimental/nvngx', 'runtime/experimental/nr-',
+                                     'runtime/experimental/fallback-dlssg', 'runtime/experimental/dlssg-kernels/',
+                                     'runtime/experimental/dlssg-lite/')) for n in names)
+        assert 'runtime_local/amd/fidelityfx/amd_fidelityfx_framegeneration_dx12.dll' in names
     else:
         assert not any(n.startswith(('runtime/nvidia-vfg/', 'runtime/experimental/nvngx', 'runtime/experimental/nr-',
                                      'runtime/experimental/fallback-dlssg', 'runtime/experimental/dlssg-kernels/',
@@ -121,7 +137,7 @@ def stage_packages(args):
     vfg_ids = signature_audit([args.runtime_source / r['path'] for r in vfg['files']])
     amd = audit_amd_source(args.amd_source)
     amd_version = amd.get('version', '0.39')
-    for flavor in ('NVIDIA', 'AMD'):
+    for flavor in FLAVORS:
         stage = args.output / f'Veyra-{args.version}-{flavor}-win64-portable'
         stage.mkdir(parents=True, exist_ok=False)
         for row in common['files']:
@@ -142,7 +158,7 @@ def stage_packages(args):
             for folder in ('nvidia-vfg', 'vfg-samples'):
                 for f in (args.runtime_source / 'licenses' / folder).rglob('*'):
                     if f.is_file(): checked_copy(f, stage, 'licenses/' + folder + '/' + f.relative_to(args.runtime_source / 'licenses' / folder).as_posix())
-        else:
+        elif flavor == 'AMD':
             amd_rows = []
             for row in amd['files']:
                 source = args.amd_source / row['path']
@@ -164,7 +180,10 @@ def stage_packages(args):
         write_json(stage / 'release-runtime-manifest.json', runtime_manifest)
         write_json(stage / 'runtime/experimental/release-runtime-manifest.json', runtime_manifest)
         text = ('NVIDIA: NR Lecram / SF-v2 / original, DLSS/RTX SR, DLSS FG, VFG 2-8X, FSR 3.1 and XeSS. No AMD NR. Shared FidelityFX 2.3.0 components remain; FSR4 ML is disabled on NVIDIA.\n'
-                if flavor == 'NVIDIA' else f'AMD: lmxxf NR {amd_version} (RX9000, requires HIP 7), FSR4 with FSR3.1 compatibility and XeSS. Small/Original selection requires the complete 0.44 runtime. No NVIDIA DLSS/NGX/VFG/CUDA runtime. AMD inference still awaits physical RX9000 verification.\n')
+                if flavor == 'NVIDIA' else
+                'INTEL: Intel Arc (Alchemist / A730M / Battlemage) support with Intel XeSS SR (XMX), Intel XeSS FG/XeLL, FSR 3.1, NIS, FidelityFX optical flow, RIFE DirectML (optional runtime/rife), ANR FG (XMX download), and Intel Quick Sync 8-bit/10-bit HDR HEVC hardware export. No NVIDIA NGX/VFG or AMD HIP NR runtimes.\n'
+                if flavor == 'INTEL' else
+                f'AMD: lmxxf NR {amd_version} (RX9000, requires HIP 7), FSR4 with FSR3.1 compatibility and XeSS. Small/Original selection requires the complete 0.44 runtime. No NVIDIA DLSS/NGX/VFG/CUDA runtime. AMD inference still awaits physical RX9000 verification.\n')
         (stage / 'GPU-PACKAGE.txt').write_text('Veyra ' + args.version + ' / ' + flavor + '\n' + text +
             'Unsupported functions stay visible and disabled. Use the package matching the GPU used by Veyra. Extract with 7-Zip, then run veyra_qml_ui.exe. Model/DLL bytes are unmodified; default effects are off.\n', encoding='utf8')
         check_vendor(stage, flavor)
@@ -178,7 +197,7 @@ def stage_packages(args):
 def finalize(args):
     assert not subprocess.check_output(['git', '-C', str(ROOT), 'status', '--porcelain']).strip(), 'Commit before finalizing'
     commit = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD']).decode().strip()
-    for flavor in ('NVIDIA', 'AMD'):
+    for flavor in FLAVORS:
         stage = args.output / f'Veyra-{args.version}-{flavor}-win64-portable'
         manifest = json.loads((stage / 'package-manifest.json').read_text(encoding='utf8'))
         for row in manifest['files']:
@@ -205,7 +224,7 @@ def finalize(args):
 
 
 def archive(args):
-    for flavor in ('NVIDIA', 'AMD'):
+    for flavor in FLAVORS:
         stage = args.output / f'Veyra-{args.version}-{flavor}-win64-portable'
         check_vendor(stage, flavor)
         manifest = json.loads((stage / 'package-manifest.json').read_text(encoding='utf8'))
@@ -225,7 +244,7 @@ def archive(args):
 def refresh(args):
     # An explicit rebuild replaces only the production executable and QML.
     # Other identities are checked against the previous staging manifest first.
-    for flavor in ('NVIDIA', 'AMD'):
+    for flavor in FLAVORS:
         stage = args.output / f'Veyra-{args.version}-{flavor}-win64-portable'
         manifest = json.loads((stage / 'package-manifest.json').read_text(encoding='utf8'))
         for row in manifest['files']:
@@ -283,7 +302,7 @@ if __name__ == '__main__':
     elif args.mode == 'finalize': finalize(args)
     elif args.mode == 'archive': archive(args)
     else:
-        for flavor in ('NVIDIA', 'AMD'):
+        for flavor in FLAVORS:
             stage = args.output / f'Veyra-{args.version}-{flavor}-win64-portable'
             names = check_vendor(stage, flavor)
             print('VENDOR CONTENT PASS', flavor, len(names))

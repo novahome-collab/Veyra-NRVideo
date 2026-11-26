@@ -11,6 +11,15 @@ name: Windows build (reproducible)
 
 on:
   workflow_dispatch:
+    inputs:
+      include_intel_xess_runtime:
+        description: 'Bundle official Intel XeSS SDK 3.0.2 & FidelityFX runtime DLLs into runtime_local/ for Intel Arc'
+        type: boolean
+        default: true
+      include_rife_dml_headers:
+        description: 'Fetch ONNX Runtime DirectML + DirectML NuGet headers so RIFE DirectML FG is compiled in'
+        type: boolean
+        default: true
   push:
     # Branch pushes run only when the CI files change; version tags always run
     # (GitHub does not apply path filters to tag pushes).
@@ -56,6 +65,19 @@ jobs:
         run: |
           if (Test-Path third_party_local) { throw 'third_party_local must not be tracked in Git' }
           scripts/ci/fetch-sdks.ps1 -VeyraRoot . -WorkRoot C:\sdk-src -ManifestOut C:\sdk-manifest.json
+
+      - name: Stage ONNX Runtime DirectML & DirectML headers (RIFE FG)
+        if: github.event_name != 'workflow_dispatch' || inputs.include_rife_dml_headers
+        run: |
+          New-Item -ItemType Directory -Force C:\ort-dml\ort, C:\ort-dml\dml | Out-Null
+          Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.24.4' -OutFile C:\ort-dml\ort.nupkg
+          Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.4' -OutFile C:\ort-dml\dml.nupkg
+          Expand-Archive -Path C:\ort-dml\ort.nupkg -DestinationPath C:\ort-dml\ort -Force
+          Expand-Archive -Path C:\ort-dml\dml.nupkg -DestinationPath C:\ort-dml\dml -Force
+          if (!(Test-Path C:\ort-dml\ort\build\native\include\dml_provider_factory.h) -or !(Test-Path C:\ort-dml\dml\include\DirectML.h)) {
+            throw 'ONNX Runtime DirectML or DirectML headers missing after NuGet extraction'
+          }
+          "VEYRA_ORT_DML_ARG=-DVEYRA_ORT_DML_ROOT=C:/ort-dml" >> $env:GITHUB_ENV
 
       - name: Install Qt ${{ env.QT_VERSION }}
         uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005 # v4.3.0
@@ -139,6 +161,8 @@ jobs:
 
       - name: Configure (preset x64-release)
         run: |
+          $extra = @()
+          if ($env:VEYRA_ORT_DML_ARG) { $extra += $env:VEYRA_ORT_DML_ARG }
           cmake --preset x64-release -B C:\b `
             -DVEYRA_BUILD_QML_UI=ON `
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
@@ -146,13 +170,22 @@ jobs:
             -DVEYRA_FFMPEG_ROOT=C:/v/installed/x64-windows `
             -DVEYRA_LIBASS_ROOT=C:/v/installed/x64-windows-static `
             -DVEYRA_LIBDOVI_ROOT=C:/dovi `
-            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR" `
+            @extra
 
-      - name: Build veyra_qml_ui, virtual camera and shaders
+      - name: Build veyra_qml_ui, virtual camera, shaders and unit tests
         run: |
-          cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components
+          cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components veyra_effect_availability_tests veyra_repair_contract_tests veyra_video_ai_settings_tests
           $shaders = ninja -C C:\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
           if ($shaders) { cmake --build C:\b --parallel --target @shaders }
+          & C:\b\veyra_effect_availability_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "veyra_effect_availability_tests failed ($LASTEXITCODE)" }
+          & C:\b\veyra_repair_contract_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "veyra_repair_contract_tests failed ($LASTEXITCODE)" }
+          $tmpTestDir = "C:\b\video-ai-settings-test"
+          if (Test-Path $tmpTestDir) { Remove-Item $tmpTestDir -Recurse -Force }
+          & C:\b\veyra_video_ai_settings_tests.exe $tmpTestDir
+          if ($LASTEXITCODE -ne 0) { throw "veyra_video_ai_settings_tests failed ($LASTEXITCODE)" }
 
       - name: Stage portable package
         run: |
@@ -185,6 +218,27 @@ jobs:
             }
           }
           Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC143.CRT\*.dll" $stage
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ inputs.include_intel_xess_runtime }}' -eq 'true') {
+            $xessDst = "$stage\runtime_local\intel\experimental"
+            New-Item -ItemType Directory -Force $xessDst | Out-Null
+            foreach ($dll in 'libxess.dll', 'libxess_fg.dll', 'libxell.dll') {
+              $found = Get-ChildItem C:\sdk-src\xess -Recurse -Filter $dll -File -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { Copy-Item $found.FullName $xessDst }
+            }
+            $ffxDst = "$stage\runtime_local\amd\fidelityfx"
+            New-Item -ItemType Directory -Force $ffxDst | Out-Null
+            foreach ($dll in 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll') {
+              $found = Get-ChildItem C:\sdk-src\FidelityFX-SDK -Recurse -Filter $dll -File -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { Copy-Item $found.FullName $ffxDst }
+            }
+            if (Test-Path C:\ort-dml\ort\runtimes\win-x64\native\onnxruntime.dll) {
+              $rifeDst = "$stage\runtime\rife"
+              New-Item -ItemType Directory -Force $rifeDst | Out-Null
+              Copy-Item C:\ort-dml\ort\runtimes\win-x64\native\onnxruntime.dll $rifeDst
+              Copy-Item C:\ort-dml\ort\runtimes\win-x64\native\onnxruntime_providers_shared.dll $rifeDst -ErrorAction SilentlyContinue
+              Copy-Item C:\ort-dml\dml\bin\x64-win\DirectML.dll $rifeDst
+            }
+          }
           foreach ($f in 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'README_EN.md') { Copy-Item $f $stage }
           @'
           Veyra Windows CI build for development testing.

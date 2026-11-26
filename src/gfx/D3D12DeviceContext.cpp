@@ -5,6 +5,8 @@
 #include <winevt.h>
 #pragma comment(lib, "wevtapi.lib")
 
+#include <algorithm>
+#include <cwctype>
 #include <format>
 #include <string>
 #include <vector>
@@ -32,13 +34,13 @@ std::string narrow(const std::wstring& text)
     return converted;
 }
 
-// Driver version from the kernel service key: first the friendly
-// DisplayVersion string when present, otherwise the file version of the
-// nvlddmkm.sys image the ImagePath value points at.
-std::wstring queryNvidiaDriverVersion()
+// Driver version from a kernel service key: first the friendly DisplayVersion
+// string when present, otherwise the file version of the driver image the
+// ImagePath value points at.
+std::wstring queryServiceDriverVersion(const wchar_t* serviceKey)
 {
     HKEY key = nullptr;
-    const LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\nvlddmkm",
+    const LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, serviceKey,
         0, KEY_QUERY_VALUE, &key);
     if (openResult != ERROR_SUCCESS) {
         return {};
@@ -94,6 +96,41 @@ std::wstring queryNvidiaDriverVersion()
     return {};
 }
 
+std::wstring queryNvidiaDriverVersion()
+{
+    return queryServiceDriverVersion(L"SYSTEM\\CurrentControlSet\\Services\\nvlddmkm");
+}
+
+std::wstring queryIntelDriverVersion()
+{
+    for (const wchar_t* key : {
+            L"SYSTEM\\CurrentControlSet\\Services\\igdkmdnd64",
+            L"SYSTEM\\CurrentControlSet\\Services\\igdkmdn64",
+            L"SYSTEM\\CurrentControlSet\\Services\\igfxn",
+            L"SYSTEM\\CurrentControlSet\\Services\\igfx"}) {
+        if (auto version = queryServiceDriverVersion(key); !version.empty()) {
+            return version;
+        }
+    }
+    return {};
+}
+
+bool containsAsciiCaseInsensitive(std::wstring_view haystack, std::wstring_view needle)
+{
+    if (needle.empty() || haystack.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (std::towlower(haystack[i + j]) != std::towlower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 bool fillAdapterInfo(const DXGI_ADAPTER_DESC1& desc, AdapterInfo& info)
 {
     info.description = desc.Description;
@@ -106,14 +143,37 @@ bool fillAdapterInfo(const DXGI_ADAPTER_DESC1& desc, AdapterInfo& info)
         static_cast<uint64_t>(desc.AdapterLuid.LowPart));
     info.dedicatedVideoMemoryBytes = desc.DedicatedVideoMemory;
     info.isNvidia = desc.VendorId == 0x10DE;
+    info.isIntel = desc.VendorId == 0x8086;
+    info.isIntelArc = isIntelArcDevice(desc.VendorId, desc.DeviceId, desc.Description);
     info.deviceId = desc.DeviceId;
     info.isSoftware = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-    info.driverVersion = info.isNvidia?queryNvidiaDriverVersion():std::wstring{};
+    info.driverVersion = info.isNvidia ? queryNvidiaDriverVersion()
+        : info.isIntel ? queryIntelDriverVersion() : std::wstring{};
     info.driverVersionSource = info.driverVersion.empty() ? L"unavailable" : L"registry";
     return !info.isSoftware;
 }
 
 } // namespace
+
+bool isIntelArcDevice(uint32_t vendorId, uint32_t deviceId, std::wstring_view description)
+{
+    if (vendorId != 0x8086) return false;
+    // Alchemist discrete mobile/desktop/pro (including Arc A730M = 0x5691) and Battlemage discrete.
+    const bool knownDiscreteArcId =
+        (deviceId >= 0x5690u && deviceId <= 0x56BFu) ||
+        (deviceId >= 0xE200u && deviceId <= 0xE22Fu);
+    if (knownDiscreteArcId) return true;
+    return containsAsciiCaseInsensitive(description, L"Intel(R) Arc") ||
+           containsAsciiCaseInsensitive(description, L"Intel Arc");
+}
+
+bool isIntegratedLowVramIntelAdapter(const DXGI_ADAPTER_DESC1& desc)
+{
+    constexpr uint64_t kOneGiB = 1024ull * 1024ull * 1024ull;
+    return desc.VendorId == 0x8086 &&
+           !isIntelArcDevice(desc.VendorId, desc.DeviceId, desc.Description) &&
+           desc.DedicatedVideoMemory < kOneGiB;
+}
 
 D3D12DeviceContext::~D3D12DeviceContext()
 {
@@ -179,8 +239,14 @@ bool D3D12DeviceContext::initialize(const DeviceContextDesc& desc, Status& statu
     // Keep every backend on one hardware adapter. Never silently use WARP.
     // The user's compute adapter (preferredAdapterLuid) is tried first when
     // the caller did not pin one; the default order remains the fallback.
+    // On hybrid Intel laptops (Intel iGPU + Intel Arc dGPU such as A730M),
+    // prefer a discrete adapter (>= 2 GiB VRAM or Intel Arc) over a low-VRAM
+    // Intel iGPU if DXGI returns the iGPU first in default order.
     DXGI_ADAPTER_DESC1 chosenDesc{};
     bool chosen = false;
+    ComPtr<IDXGIAdapter1> fallbackIgpu;
+    DXGI_ADAPTER_DESC1 fallbackIgpuDesc{};
+    bool hasFallbackIgpu = false;
     const uint64_t preferred = desc.requiredLuid ? 0 : preferredAdapterLuid();
     for (int pass = preferred ? 0 : 1; pass < 2 && !chosen; ++pass)
     for (UINT index = 0;; ++index) {
@@ -205,9 +271,10 @@ bool D3D12DeviceContext::initialize(const DeviceContextDesc& desc, Status& statu
         }
 
         const bool isSoftware = (candidateDesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-        veyra::log::info("gfx", std::format("adapter[{}] vendorId=0x{:04X} software={} dedicatedVideoMiB={} desc={}",
-            index, candidateDesc.VendorId, isSoftware,
+        veyra::log::info("gfx", std::format("adapter[{}] vendorId=0x{:04X} deviceId=0x{:04X} software={} dedicatedVideoMiB={} arc={} desc={}",
+            index, candidateDesc.VendorId, candidateDesc.DeviceId, isSoftware,
             candidateDesc.DedicatedVideoMemory / (1024 * 1024),
+            isIntelArcDevice(candidateDesc.VendorId, candidateDesc.DeviceId, candidateDesc.Description),
             narrow(candidateDesc.Description)));
 
         const auto candidateLuid=(uint64_t(uint32_t(candidateDesc.AdapterLuid.HighPart))<<32)|candidateDesc.AdapterLuid.LowPart;
@@ -215,11 +282,24 @@ bool D3D12DeviceContext::initialize(const DeviceContextDesc& desc, Status& statu
         if ((!desc.requiredVendorId||candidateDesc.VendorId==desc.requiredVendorId) &&
             (!desc.requiredLuid||candidateLuid==desc.requiredLuid) && !isSoftware &&
             SUCCEEDED(D3D12CreateDevice(candidate.Get(),D3D_FEATURE_LEVEL_12_0,__uuidof(ID3D12Device),nullptr))) {
+            if (pass == 1 && !desc.requiredLuid && isIntegratedLowVramIntelAdapter(candidateDesc)) {
+                if (!hasFallbackIgpu) {
+                    fallbackIgpu = candidate;
+                    fallbackIgpuDesc = candidateDesc;
+                    hasFallbackIgpu = true;
+                }
+                continue;
+            }
             adapter_ = candidate;
             chosenDesc = candidateDesc;
             chosen = true;
             break;
         }
+    }
+    if (!chosen && hasFallbackIgpu) {
+        adapter_ = fallbackIgpu;
+        chosenDesc = fallbackIgpuDesc;
+        chosen = true;
     }
 
     if (!chosen) {

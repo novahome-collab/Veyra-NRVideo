@@ -12,6 +12,8 @@ struct EffectGpu {
     uint32_t deviceId = 0;
     bool rx7000 = false;
     bool ampere = false;
+    bool intel = false;
+    bool intelArc = false;
 };
 constexpr bool hardwareSupports(HardwareEffect effect, EffectGpu gpu) {
     switch (effect) {

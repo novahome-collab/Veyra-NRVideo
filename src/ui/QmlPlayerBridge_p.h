@@ -4,6 +4,8 @@
 #include "veyra/media/FFmpegDeinterlacer.h"
 #include "veyra/ui/QmlPlayerBridge.h"
 #include "veyra/gfx/PresentSink.h"
+#include "veyra/gfx/D3D12DeviceContext.h"
+#include "veyra/gfx/XessSrBackend.h"
 #include "veyra/gfx/NvidiaVrr.h"
 #include "veyra/media/NetworkInput.h"
 #include "veyra/media/FormatBadgeWindow.h"
@@ -732,26 +734,41 @@ struct QmlPlayerBridge::Impl {
             QFile file(QString::fromStdWString(anchorsFile.wstring()));
             if (file.open(QIODevice::ReadOnly)) anchors = QJsonDocument::fromJson(file.readAll()).object().toVariantMap();
         }
-        // Same high-performance DXGI ordering as the engine. This only seeds a
-        // fresh session; loading saved settings below preserves manual choices.
+        // Same high-performance DXGI ordering as the engine (preferring discrete
+        // GPUs such as Intel Arc A730M over a low-VRAM Intel iGPU). This only
+        // seeds a fresh session; loading saved settings below preserves manual choices.
         gfx::ComPtr<IDXGIFactory6> factory;
         if(SUCCEEDED(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)))) {
-            gfx::ComPtr<IDXGIAdapter1> adapter;
-            for(UINT i=0;SUCCEEDED(factory->EnumAdapterByGpuPreference(i,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,IID_PPV_ARGS(&adapter)));++i) {
+            DXGI_ADAPTER_DESC1 chosenDesc{};
+            bool hasChosen=false;
+            DXGI_ADAPTER_DESC1 fallbackIgpu{};
+            bool hasFallbackIgpu=false;
+            for(UINT i=0;;++i) {
+                gfx::ComPtr<IDXGIAdapter1> adapter;
+                if(FAILED(factory->EnumAdapterByGpuPreference(i,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,IID_PPV_ARGS(&adapter)))||!adapter)break;
                 DXGI_ADAPTER_DESC1 desc{};
                 if(FAILED(adapter->GetDesc1(&desc))||(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE))continue;
-                auto initial=facade.pendingSettings();
-                initial.nrRuntime=desc.VendorId==0x1002?engine::NrRuntime::LmxxfAmd:engine::NrRuntime::Ampere;
-                if(desc.VendorId==0x1002||desc.VendorId==0x8086){
-                    initial.opticalFlowBackend=engine::OpticalFlowBackend::AmdFidelityFx;
-                    initial.videoSrQuality=engine::kVideoSrFsr;
+                if(gfx::isIntegratedLowVramIntelAdapter(desc)){
+                    if(!hasFallbackIgpu){fallbackIgpu=desc;hasFallbackIgpu=true;}
+                    continue;
                 }
-                // RX 9000 starts on FSR 4 ML (the same name rule as its menu gate, effectGpu()).
-                initial.frameGenerationBackend=engine::defaultFrameGenerationBackend(desc.VendorId,
-                    QString::fromWCharArray(desc.Description).contains(QStringLiteral("RX 90"),Qt::CaseInsensitive));
+                chosenDesc=desc;hasChosen=true;break;
+            }
+            if(!hasChosen&&hasFallbackIgpu){chosenDesc=fallbackIgpu;hasChosen=true;}
+            if(hasChosen) {
+                const bool intelArc=gfx::isIntelArcDevice(chosenDesc.VendorId,chosenDesc.DeviceId,chosenDesc.Description);
+                auto initial=facade.pendingSettings();
+                initial.nrRuntime=chosenDesc.VendorId==0x1002?engine::NrRuntime::LmxxfAmd:engine::NrRuntime::Ampere;
+                if(chosenDesc.VendorId==0x1002||chosenDesc.VendorId==0x8086){
+                    initial.opticalFlowBackend=engine::OpticalFlowBackend::AmdFidelityFx;
+                    initial.videoSrQuality=(intelArc&&gfx::XessSrBackend::runtimeInstalled())?engine::kVideoSrXess:engine::kVideoSrFsr;
+                }
+                // RX 9000 starts on FSR 4 ML; Intel Arc prefers native XeSS FG when installed (restored to FSR 3.1 if absent).
+                initial.frameGenerationBackend=engine::defaultFrameGenerationBackend(chosenDesc.VendorId,
+                    QString::fromWCharArray(chosenDesc.Description).contains(QStringLiteral("RX 90"),Qt::CaseInsensitive),
+                    intelArc);
                 facade.setPending(initial);
-                veyra::log::info("nr-default",std::format("adapter={} selected={}",utf8Of(std::wstring(desc.Description)).toStdString(),engine::nrRuntimeName(initial.nrRuntime)));
-                break;
+                veyra::log::info("nr-default",std::format("adapter={} arc={} selected={}",utf8Of(std::wstring(chosenDesc.Description)).toStdString(),intelArc,engine::nrRuntimeName(initial.nrRuntime)));
             }
         }
         chain = engine::toChain(facade.pendingSettings());

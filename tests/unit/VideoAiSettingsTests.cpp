@@ -48,7 +48,7 @@ int wmain(int argc,wchar_t** argv){
     for(uint32_t q=0;q<40;++q){
         const bool rtx=(q>=1&&q<=4)||(q>=16&&q<=19)||q==21||q==23;
         check(rtxVideoSr(q)==rtx,"RTX Video SR family values");
-        check(validVideoSrQuality(q)==(rtx||q==0||q==kVideoSrFsr||q==24||q==25||q==26),"stored SR quality table");
+        check(validVideoSrQuality(q)==(rtx||q==0||q==kVideoSrFsr||q==24||q==25||q==26||q==kVideoSrXess),"stored SR quality table");
         EnhancementSettings s;s.sr=true;s.videoSrQuality=q;
         check(s.validate().empty()==validVideoSrQuality(q),"validation accepts exactly the stored SR qualities");
         check(ngxVideoSr(q)==(q>=1&&q<=4)&&vfxVideoSr(q)==(rtx&&q>4),"standard runs on NGX, the others on Video Effects");
@@ -102,8 +102,8 @@ int wmain(int argc,wchar_t** argv){
         check(s.validate().empty(),"high bitrate base with a streaming second pass");
         auto active=s.activeVideoSettings();
         check(active.dualSrEnabled&&active.dualSrQuality==23&&active.srPrescale==SrPrescale::P1080,"double SR stays active on high bitrate");
-        for(uint32_t bad2:{6u,15u,20u,22u,27u}){auto bad=s;bad.dualSrQuality=bad2;check(!bad.validate().empty(),"second SR must be a stored SR value");}
-        for(uint32_t good2:{0u,kVideoSrFsr,kVideoSrNis,kVideoSrAmf10,kVideoSrAmf11}){auto good=s;good.dualSrQuality=good2;check(good.validate().empty(),"DLSS, FSR, NIS and AMD VideoSR are valid second passes");}
+        for(uint32_t bad2:{6u,15u,20u,22u,28u}){auto bad=s;bad.dualSrQuality=bad2;check(!bad.validate().empty(),"second SR must be a stored SR value");}
+        for(uint32_t good2:{0u,kVideoSrFsr,kVideoSrNis,kVideoSrAmf10,kVideoSrAmf11,kVideoSrXess}){auto good=s;good.dualSrQuality=good2;check(good.validate().empty(),"DLSS, FSR, XeSS, NIS and AMD VideoSR are valid second passes");}
         s.videoSrQuality=4;s.dualSrQuality=17;check(s.validate().empty()&&s.activeVideoSettings().dualSrEnabled,"standard base with a high bitrate second pass");
         s.videoSrQuality=0;check(s.activeVideoSettings().dualSrEnabled,"a DLSS SR base runs double SR");
         s.videoSrQuality=kVideoSrFsr;check(s.activeVideoSettings().dualSrEnabled,"an FSR base runs double SR");
@@ -141,6 +141,12 @@ int wmain(int argc,wchar_t** argv){
         s.videoSrQuality=kVideoSrFsr;s.dualSrQuality=kVideoSrFsr;
         const auto amd=describe(s,1280,720,nullptr,false);
         check(amd.enableSr&&amd.dualSr&&amd.srInputWidth==1920,"FSR -> FSR double SR runs on a non-NVIDIA adapter");
+        s.videoSrQuality=kVideoSrXess;s.dualSrQuality=kVideoSrXess;
+        const auto intelXess=describe(s,1280,720,nullptr,false);
+        check(intelXess.enableSr&&intelXess.dualSr&&intelXess.videoSrQuality==kVideoSrXess&&intelXess.dualSrQuality==kVideoSrXess,
+              "Intel XeSS SR -> XeSS SR double SR runs on a non-NVIDIA adapter");
+        check(!describe(s,1280,720,nullptr,false,true).dualSr,"no double SR with XeSS SR on a still image");
+        s.videoSrQuality=kVideoSrFsr;
         s.dualSrQuality=2;const auto amdSingle=describe(s,1280,720,nullptr,false);
         check(!amdSingle.dualSr&&amdSingle.enableSr,"a non-NVIDIA adapter keeps the single FSR pass when the second pass needs NVIDIA");
         // FSR skips still images, so a double SR with an FSR pass keeps one pass there.

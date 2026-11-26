@@ -42,6 +42,12 @@ int main() {
     verify(hardwareSupports(HardwareEffect::NvidiaAmpere,devices[2]));
     verify(!hardwareSupports(HardwareEffect::NvidiaAmpere,devices[3]));
     verify(!hardwareSupports(HardwareEffect::NvidiaAmpere,devices[6]));
+    EffectGpu intelArcGpu{};intelArcGpu.vendor=0x8086;intelArcGpu.deviceId=0x5691;intelArcGpu.intel=true;intelArcGpu.intelArc=true;
+    verify(hardwareSupports(HardwareEffect::CrossVendor,intelArcGpu));
+    verify(!hardwareSupports(HardwareEffect::Nvidia,intelArcGpu));
+    verify(!hardwareSupports(HardwareEffect::AmdNr,intelArcGpu));
+    verify(!hardwareSupports(HardwareEffect::Fsr4,intelArcGpu));
+    verify(!hardwareSupports(HardwareEffect::AmdFrc,intelArcGpu));
     verify(rdna3::validExtent(1920,1080)&&rdna3::validExtent(2560,800));
     verify(!rdna3::validExtent(3840,2160)&&!rdna3::validExtent(2560,1080)&&!rdna3::validExtent(0,1080));
     rdna3::Evaluate packet;verify(rdna3::validHeader(packet.h,rdna3::Op::Evaluate,sizeof(packet)));

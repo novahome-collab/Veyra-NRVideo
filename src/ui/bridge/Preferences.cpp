@@ -4,6 +4,7 @@
 #include "veyra/ngx/AnrProvider.h"
 #include "veyra/gfx/AmfFrcBackend.h"
 #include "veyra/gfx/RifeDmlBackend.h"
+#include "veyra/gfx/XessSrBackend.h"
 #include "veyra/ui/UpdateChecker.h"
 
 namespace veyra::ui {
@@ -95,6 +96,27 @@ QVariantList QmlPlayerBridge::readComponentList() const {
     out<<QVariantMap{{"name",QStringLiteral("RIFE (ONNX Runtime DirectML)")},
         {"detail",QString::fromStdWString((runtime::applicationRoot()/L"runtime"/L"rife").wstring())},
         {"loaded",gfx::RifeDmlBackend::runtimeInstalled()},{"experimental",true}};
+    // Intel XeSS Super Resolution (libxess.dll) and Frame Generation (libxess_fg.dll + libxell.dll).
+    const auto xessSrPath = gfx::XessSrBackend::runtimePath();
+    out<<QVariantMap{{"name",QStringLiteral("Intel XeSS SR (XMX / DP4a)")},
+        {"detail",QString::fromStdWString((xessSrPath.empty() ? (runtime::localDataDirectory()/L"intel"/L"experimental"/L"libxess.dll") : xessSrPath).wstring())},
+        {"loaded",!xessSrPath.empty()}};
+    {
+        std::error_code ec;
+        const auto data = runtime::localDataDirectory();
+        const auto app = runtime::applicationRoot();
+        std::filesystem::path xessFgDir = data / L"intel" / L"experimental";
+        bool xessFgLoaded = false;
+        for (const auto& dir : {data / L"intel" / L"experimental", data / L"intel" / L"xess", app / L"runtime" / L"intel"}) {
+            if (std::filesystem::is_regular_file(dir / L"libxess_fg.dll", ec) &&
+                std::filesystem::is_regular_file(dir / L"libxell.dll", ec)) {
+                xessFgDir = dir; xessFgLoaded = true; break;
+            }
+        }
+        out<<QVariantMap{{"name",QStringLiteral("Intel XeSS FG / XeLL")},
+            {"detail",QString::fromStdWString(xessFgDir.wstring())},
+            {"loaded",xessFgLoaded}};
+    }
     const auto vfgDirectory=pipeline::VfgBackend::runtimeDirectory(runtime::localRuntimeDirectory().wstring());
     const bool vfgAvailable=pipeline::VfgBackend::runtimeAvailable(runtime::localRuntimeDirectory().wstring());
     out<<QVariantMap{{"name",QStringLiteral("NVIDIA VFG")},{"detail",QString::fromStdWString(vfgDirectory)},

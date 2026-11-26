@@ -42,8 +42,9 @@ inline EnhancementSettings freezeExportSettings(EnhancementSettings settings) {
 }
 // XeSS owns Present calls and exposes no encoder input texture in this
 // integration. Every other backend writes application-owned graph textures.
-constexpr bool exportFrameGenerationSupported(FrameGenerationBackend backend,bool nvidia) {
-    if(fsrFrameGeneration(backend)||backend==FrameGenerationBackend::Anr||backend==FrameGenerationBackend::AmdFrc||backend==FrameGenerationBackend::Rife)return true;
+constexpr bool exportFrameGenerationSupported(FrameGenerationBackend backend,bool nvidia,bool amd=true) {
+    if(backend==FrameGenerationBackend::Fsr||backend==FrameGenerationBackend::Anr||backend==FrameGenerationBackend::Rife)return true;
+    if(backend==FrameGenerationBackend::Fsr4||backend==FrameGenerationBackend::AmdFrc)return amd;
     return nvidia&&(backend==FrameGenerationBackend::Dlss||backend==FrameGenerationBackend::Vfg);
 }
 }

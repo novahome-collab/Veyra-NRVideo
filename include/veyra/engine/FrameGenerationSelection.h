@@ -21,9 +21,12 @@ struct FrameGenerationAvailability {
 };
 // A fresh profile on an AMD RX 9000 starts on FSR 4 ML, AMD's ML frame
 // generation; when the driver's provider does not offer it, the engine switches
-// to FSR 3.1 at 2X and says so. Other AMD and Intel GPUs start on FSR 3.1.
-constexpr FrameGenerationBackend defaultFrameGenerationBackend(uint32_t vendor, bool rx9000 = false) {
+// to FSR 3.1 at 2X and says so. Intel Arc GPUs prefer native Intel XeSS FG when
+// available (falling back to FSR 3.1 via restoredFrameGenerationBackend). Other
+// AMD and Intel GPUs start on FSR 3.1.
+constexpr FrameGenerationBackend defaultFrameGenerationBackend(uint32_t vendor, bool rx9000 = false, bool intelArc = false) {
     return vendor == 0x1002 && rx9000 ? FrameGenerationBackend::Fsr4
+        : vendor == 0x8086 && intelArc ? FrameGenerationBackend::XeSS
         : vendor == 0x1002 || vendor == 0x8086 ? FrameGenerationBackend::Fsr : FrameGenerationBackend::Dlss;
 }
 // Keep usable manual choices. An unavailable saved choice prefers FSR 4 ML where

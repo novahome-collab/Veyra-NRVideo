@@ -55,17 +55,31 @@ QString QmlPlayerBridge::fgProviderText() const {
     if(fgBackendName()==QLatin1String("amdfrc"))return tr("AMD 驱动自带的视频补帧（AMF FRC），只用前后两帧画面估算运动，固定 2X");
     if(fgBackendName()==QLatin1String("fsr4"))return tr("FSR 4 ML 需要支持的 RX 9000 和驱动，不可用时自动改用 FSR 3.1；尚未在 RX 9000 实卡上验证");
     if(fgBackendName()==QLatin1String("fsr3"))return tr("FSR 3.1 跨厂商补帧 · 最高 2X");
-    if(fgBackendName()==QLatin1String("xess"))
+    if(fgBackendName()==QLatin1String("xess")){
+        if(effectGpu().intelArc)
+            return tr("Intel Arc 原生 XeSS-FG 路径（支持 2X～4X，上限以运行库能力为准）");
         return fgMaxMultiplier()<4?tr("当前 XeSS 模块未匹配 3X / 4X 解锁版本；2X 可用，请在组件页核对版本"):
             tr("2X 为原生路径，3X / 4X 为实验解锁；失败原因见诊断");
+    }
     return tr("NVIDIA RTX 补帧；倍率以运行库实际能力为准");
 }
-// XeSS ceiling (SettingsWindow): 4X with the audited unlock provider, else 2X,
-// or a running session's reported interpolation count above 2X.
+// XeSS ceiling (SettingsWindow): 4X on Intel Arc or with the audited unlock
+// provider, else 2X, or a running session's reported interpolation count above 2X.
 int xessCeiling(const engine::PlayerSnapshot& s) {
-    static const bool audited = gfx::XessMfgUnlock::providerIsAudited(
-        (runtime::localDataDirectory() / L"intel" / L"experimental" / L"libxess_fg.dll").wstring());
-    int cap = audited ? 4 : 2;
+    auto findFgDll = []() -> std::filesystem::path {
+        std::error_code ec;
+        const auto data = runtime::localDataDirectory();
+        const auto app = runtime::applicationRoot();
+        for (const auto& path : {data / L"intel" / L"experimental" / L"libxess_fg.dll",
+                                 data / L"intel" / L"xess" / L"libxess_fg.dll",
+                                 app / L"runtime" / L"intel" / L"libxess_fg.dll"}) {
+            if (std::filesystem::is_regular_file(path, ec)) return path;
+        }
+        return data / L"intel" / L"experimental" / L"libxess_fg.dll";
+    };
+    const auto dllPath = findFgDll();
+    const bool audited = gfx::XessMfgUnlock::providerIsAudited(dllPath.wstring());
+    int cap = (audited || effectGpu().intelArc) ? 4 : 2;
     // A running context reports the count it was CREATED with (3X -> 2), not
     // what the provider allows: it may raise the ceiling, never lower it.
     // Lowering it made 4X vanish after picking 3X until the backend was reset.

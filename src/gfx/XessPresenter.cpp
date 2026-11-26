@@ -4,7 +4,10 @@
 #include "veyra/RuntimePaths.h"
 #include "veyra/gfx/XessMfgUnlock.h"
 #include "veyra/gfx/XessPacing.h"
+#include <dxgi1_4.h>
+#include <wrl/client.h>
 #include <atomic>
+#include <filesystem>
 #ifdef VEYRA_HAS_XESS
 #include <xess_fg/xefg_swapchain_d3d12.h>
 #include <xess_fg/xefg_swapchain_debug.h>
@@ -22,6 +25,30 @@ std::string narrowDetail(const std::wstring& value){
     std::string text(size_t(length),'\0');
     WideCharToMultiByte(CP_UTF8,0,value.c_str(),int(value.size()),text.data(),length,nullptr,nullptr);
     return text;
+}
+bool isIntelAdapter(ID3D12Device* device){
+    if(!device)return false;
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))return false;
+    if(FAILED(factory->EnumAdapterByLuid(device->GetAdapterLuid(),IID_PPV_ARGS(&adapter)))||!adapter)return false;
+    DXGI_ADAPTER_DESC1 desc{};
+    return SUCCEEDED(adapter->GetDesc1(&desc))&&desc.VendorId==0x8086;
+}
+std::filesystem::path findXessFgDirectory(){
+    std::error_code ec;
+    const auto data=veyra::runtime::localDataDirectory();
+    const auto app=veyra::runtime::applicationRoot();
+    const std::filesystem::path candidates[]={
+        data/"intel"/"experimental",
+        data/"intel"/"xess",
+        app/"runtime"/"intel",
+    };
+    for(const auto& dir:candidates){
+        if(std::filesystem::is_regular_file(dir/"libxess_fg.dll",ec)&&
+           std::filesystem::is_regular_file(dir/"libxell.dll",ec))return dir;
+    }
+    return data/"intel"/"experimental";
 }
 }
 
@@ -109,7 +136,7 @@ bool XessPresenter::prepare(ID3D12Device* device,uint32_t fgMultiplier,bool lowL
         log::warn("xess-fg","test-only initialization rejection; runtime not loaded");return false;
     }
 #ifdef VEYRA_HAS_XESS
-    auto& p=*p_;const auto root=runtime::localDataDirectory()/"intel"/"experimental";
+    auto& p=*p_;const auto root=findXessFgDirectory();
     auto load=[&](const wchar_t* name){auto path=std::filesystem::absolute(root/name);
         auto module=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
         log::info("xess-fg",std::format("load {} result={} win32={}",path.string(),module!=nullptr,module?0:GetLastError()));return module;};
@@ -137,30 +164,39 @@ bool XessPresenter::prepare(ID3D12Device* device,uint32_t fgMultiplier,bool lowL
     LOAD(llDll,xellAddMarkerData)
 #undef LOAD
     // Multi-frame generation needs the audited OptiScaler unlock before the
-    // first XeFG context exists; 2X deliberately leaves the provider untouched.
+    // first XeFG context exists on non-Intel GPUs; 2X deliberately leaves the
+    // provider untouched. On Intel GPUs (e.g. Arc A730M), official newer
+    // Intel XeSS DLLs may support MFG natively without patching, so an
+    // unaudited DLL falls through to native runtime property detection.
     p.requestedGenerated=fgMultiplier>1?fgMultiplier-1:0;
-    // 2X is the provider's stock behaviour: no unlock, no pacing, and the
-    // presenter must not treat "nothing to unlock" as a failure (that used to
-    // drop the whole XeSS session back to native presentation).
+    const bool intelGpu=isIntelAdapter(device);
+    const bool forceNativeIntel=intelGpu&&GetEnvironmentVariableW(L"VEYRA_XESS_NATIVE_INTEL",nullptr,0)>0;
     if(p.requestedGenerated>1){
-        const auto unlock=XessMfgUnlock::apply(p.fgDll,p.requestedGenerated);
-        p.maxInterpolations=unlock.maxInterpolations;
-        veyra::log::info("xess-mfg",std::format("unlock requestedGenerated={} applied={} identityVerified={} recognisedBuild={}",
-            p.requestedGenerated,unlock.applied,unlock.identityVerified,unlock.recognisedBuild));
-        log::info("xess-mfg",std::format("unlock detail={}",narrowDetail(unlock.detail)));
-        if(!unlock.applied){
-            log::error("xess-mfg",std::format("unlock unavailable for {}X request; keeping stock presentation",p.requestedGenerated+1));
-            return false;
-        }
-        // Above 2X the provider presents a burst of generated frames back to
-        // back; hand its intermediate frames to its own frame scheduler.
-        if(GetEnvironmentVariableW(L"VEYRA_DISABLE_XESS_PACING",nullptr,0)==0){
-            const auto pacing=XessPacing::install(p.fgDll,p.requestedGenerated);
-            log::info("xess-pacing",std::format("install requestedGenerated={} installed={} structureVerified={} detail={}",
-                p.requestedGenerated,pacing.installed,pacing.structureVerified,
-                narrowDetail(pacing.detail)));
+        if(forceNativeIntel){
+            log::info("xess-mfg","Intel GPU with VEYRA_XESS_NATIVE_INTEL=1; using native XeSS-FG multi-frame path");
         }else{
-            log::warn("xess-pacing","disabled by VEYRA_DISABLE_XESS_PACING (diagnostic only)");
+            const auto unlock=XessMfgUnlock::apply(p.fgDll,p.requestedGenerated);
+            p.maxInterpolations=unlock.maxInterpolations;
+            veyra::log::info("xess-mfg",std::format("unlock requestedGenerated={} applied={} identityVerified={} recognisedBuild={} intelGpu={}",
+                p.requestedGenerated,unlock.applied,unlock.identityVerified,unlock.recognisedBuild,intelGpu));
+            log::info("xess-mfg",std::format("unlock detail={}",narrowDetail(unlock.detail)));
+            if(!unlock.applied){
+                if(!intelGpu){
+                    log::error("xess-mfg",std::format("unlock unavailable for {}X request; keeping stock presentation",p.requestedGenerated+1));
+                    return false;
+                }
+                log::info("xess-mfg",std::format("Intel GPU: continuing with native XeSS-FG runtime for {}X request",p.requestedGenerated+1));
+            }else if(GetEnvironmentVariableW(L"VEYRA_DISABLE_XESS_PACING",nullptr,0)==0){
+                // Above 2X the unlocked 1.3.1.78 provider presents a burst of
+                // generated frames back to back; hand its intermediate frames
+                // to its own frame scheduler.
+                const auto pacing=XessPacing::install(p.fgDll,p.requestedGenerated);
+                log::info("xess-pacing",std::format("install requestedGenerated={} installed={} structureVerified={} detail={}",
+                    p.requestedGenerated,pacing.installed,pacing.structureVerified,
+                    narrowDetail(pacing.detail)));
+            }else{
+                log::warn("xess-pacing","disabled by VEYRA_DISABLE_XESS_PACING (diagnostic only)");
+            }
         }
     }
     if(!p.check(p.xellD3D12CreateContextFn(device,&p.ll),"XeLL create",true)||!p.check(p.xefgSwapChainD3D12CreateContextFn(device,&p.fg),"Create",true))return false;

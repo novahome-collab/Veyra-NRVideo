@@ -67,12 +67,13 @@ struct StageRequest {
     bool amdAdapter=false;
 };
 
-// Both passes must be supported by the graph adapter. FSR still requires a
+// Both passes must be supported by the graph adapter. FSR and XeSS SR require a
 // video source. An inactive second pass keeps its saved settings.
 inline bool dualSrRuns(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false){
     return s.dualSrEnabled&&videoSrRunsOn(s.videoSrQuality,nvidiaAdapter,amdAdapter)&&
         videoSrRunsOn(s.dualSrQuality,nvidiaAdapter,amdAdapter)&&
-        !(stillImage&&(s.videoSrQuality==kVideoSrFsr||s.dualSrQuality==kVideoSrFsr));
+        !(stillImage&&(s.videoSrQuality==kVideoSrFsr||s.dualSrQuality==kVideoSrFsr||
+                       s.videoSrQuality==kVideoSrXess||s.dualSrQuality==kVideoSrXess));
 }
 inline pipeline::SrPrescale runningSrPrescale(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false){
     return dualSrRuns(s,nvidiaAdapter,stillImage,amdAdapter)?s.srPrescale:pipeline::SrPrescale::Off;
@@ -160,8 +161,8 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     const bool temporalMotion=settings.usesNrTemporal();
     desc.enableNvofStandalone=desc.enableNr&&(motionUsesFlow(settings.nrMotion)||temporalMotion);
     desc.enableFg=request.fg&&(request.exportJob
-        ? exportFrameGenerationSupported(settings.frameGenerationBackend,request.nvidiaAdapter)
-        : request.nvidiaAdapter||crossVendorFrameGeneration(settings.frameGenerationBackend));
+        ? exportFrameGenerationSupported(settings.frameGenerationBackend,request.nvidiaAdapter,request.amdAdapter)
+        : frameGenerationRunsOn(settings.frameGenerationBackend,request.nvidiaAdapter,request.amdAdapter));
     desc.fgMultiplier=request.fgMultiplier;
     desc.videoSrQuality=currentVideoSrQuality(settings.videoSrQuality);
     desc.dlssSrModel=settings.dlssSrModel;

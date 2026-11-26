@@ -7,6 +7,7 @@
 #include "veyra/gfx/AmfFrcBackend.h"
 #include "veyra/gfx/RifeDmlBackend.h"
 #include "veyra/gfx/AmfVideoSrBackend.h"
+#include "veyra/gfx/XessSrBackend.h"
 
 namespace veyra::ui {
 
@@ -29,6 +30,8 @@ const DXGI_ADAPTER_DESC1* engineAdapterDesc(){
     cachedFor=preferred;found=false;
     Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
     if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))return nullptr;
+    DXGI_ADAPTER_DESC1 fallbackIgpu{};
+    bool hasFallbackIgpu=false;
     for(int pass=preferred?0:1;pass<2&&!found;++pass)
         for(UINT i=0;;++i){Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
             if(FAILED(factory->EnumAdapterByGpuPreference(i,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,IID_PPV_ARGS(&adapter)))||!adapter)break;
@@ -37,8 +40,13 @@ const DXGI_ADAPTER_DESC1* engineAdapterDesc(){
             const uint64_t luid=uint64_t(uint32_t(d.AdapterLuid.HighPart))<<32|d.AdapterLuid.LowPart;
             if(pass==0&&luid!=preferred)continue;
             if(FAILED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_12_0,__uuidof(ID3D12Device),nullptr)))continue;
+            if(pass==1&&gfx::isIntegratedLowVramIntelAdapter(d)){
+                if(!hasFallbackIgpu){fallbackIgpu=d;hasFallbackIgpu=true;}
+                continue;
+            }
             cached=d;found=true;break;
         }
+    if(!found&&hasFallbackIgpu){cached=fallbackIgpu;found=true;}
     return found?&cached:nullptr;
 }
 // The menu checks the same adapter as the engine. The native backend then
@@ -69,6 +77,8 @@ ui::EffectGpu effectGpu() {
     result.ampere = name.contains("GeForce RTX 30", Qt::CaseInsensitive);
     result.rx9000 = name.contains("RX 90", Qt::CaseInsensitive);
     result.rx7000 = pipeline::amdNrProvider(d->VendorId,d->Description)==pipeline::AmdNrProvider::RedDukeRdna3;
+    result.intel = d->VendorId == 0x8086;
+    result.intelArc = gfx::isIntelArcDevice(d->VendorId, d->DeviceId, d->Description);
     return result;
 }
 
@@ -112,6 +122,8 @@ static QVariantMap scanEffectCapabilities() {
     const auto shaders = runtime::shaderDirectory();
     add(srId(engine::kVideoSrNis), H::CrossVendor, exists(shaders / "NisSdr.dxil") && exists(shaders / "NisHdr.dxil"),
         QObject::tr("需要支持 DirectX 12 的硬件显卡"));
+    add(srId(engine::kVideoSrXess), H::CrossVendor, gfx::XessSrBackend::runtimeInstalled(),
+        QObject::tr("需要支持 DirectX 12 的硬件显卡及 libxess.dll"));
     add(srId(engine::kVideoSrAmf10), H::AmdFrc, gfx::AmfVideoSrBackend::available(),
         QObject::tr("需要 AMD 显卡（驱动自带 AMF 运行库）"));
     const bool anrInstalled = ngx::AnrProvider::available(nr.wstring());
@@ -121,7 +133,12 @@ static QVariantMap scanEffectCapabilities() {
     out["anr"] = anr;
     add("dlss", H::Nvidia, exists(nr / "nvngx_dlssg.dll"), QObject::tr("需要 NVIDIA RTX 显卡"));
     add("vfg", H::Vfg, pipeline::VfgBackend::runtimeAvailable(nr.wstring()), QObject::tr("需要 NVIDIA RTX 30 / 40 / 50（30 系为实验兼容）"));
-    add("xess", H::CrossVendor, exists(data / "intel/experimental/libxess_fg.dll") && exists(data / "intel/experimental/libxell.dll"), QObject::tr("需要支持 DirectX 12 的硬件显卡"));
+    const auto appRoot = runtime::applicationRoot();
+    const bool xessFgFiles =
+        (exists(data / "intel/experimental/libxess_fg.dll") && exists(data / "intel/experimental/libxell.dll")) ||
+        (exists(data / "intel/xess/libxess_fg.dll") && exists(data / "intel/xess/libxell.dll")) ||
+        (exists(appRoot / "runtime/intel/libxess_fg.dll") && exists(appRoot / "runtime/intel/libxell.dll"));
+    add("xess", H::CrossVendor, xessFgFiles, QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     add("fsr3", H::CrossVendor, fsrLoader && exists(fsr / "amd_fidelityfx_framegeneration_dx12.dll"), QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     add("fsr4", H::Fsr4, fsrLoader && exists(fsr / "amd_fidelityfx_framegeneration_dx12.dll"), QObject::tr("需要 AMD RX 9000"));
     // AMD FRC uses the AMF runtime the AMD driver installs; nothing ships with Veyra.
@@ -134,6 +151,7 @@ static QVariantMap scanEffectCapabilities() {
     add("hdr", H::Nvidia, exists(nr / "nvngx_truehdr.dll"), QObject::tr("需要 NVIDIA RTX 显卡"));
     add("flow0", H::Nvidia, true, QObject::tr("需要 NVIDIA RTX 显卡及 NVOF 驱动"));
     add("flow1", H::CrossVendor, true, QObject::tr("需要支持 DirectX 12 的硬件显卡"));
+    add("flow2", H::CrossVendor, true, QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     return out;
 }
 // All callers are on the bridge/UI thread. Snapshot reads must not perform
@@ -265,6 +283,7 @@ QVariantList QmlPlayerBridge::srBackendChoices() const {
     struct Entry { QString id; int capability; QString label; };
     for (const auto& entry : std::initializer_list<Entry>{{"0", 0, "DLSS SR"}, {"rtx", 4, tr("RTX 视频超分 · 标准")},
             {"rtx-hb", 16, tr("RTX 视频超分 · 高码率")}, {"rtx-st", 21, tr("RTX 视频超分 · 流媒体")},
+            {QString::number(engine::kVideoSrXess), engine::kVideoSrXess, effectGpu().intelArc ? QString("Intel XeSS SR (XMX)") : QString("Intel XeSS SR")},
             {"5", 5, effectGpu().vendor == 0x1002 ? tr("FSR 3.1 / 4 · 自动兼容") : QString("FSR 3.1")},
             {QString::number(engine::kVideoSrNis), engine::kVideoSrNis, "NVIDIA NIS"},
             {QString::number(engine::kVideoSrAmf10), engine::kVideoSrAmf10, "AMD VideoSR 1.0"}}) {

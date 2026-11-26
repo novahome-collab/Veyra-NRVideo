@@ -117,25 +117,22 @@ bool containsFold(const std::wstring& haystack,const std::wstring& needle){
     return false;
 }
 
-// All hardware MFTs that accept NV12 input and produce the requested codec,
-// ordered so the active adapter's own vendor comes first. (mfenc.c:
-// MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE |
-// MFT_ENUM_FLAG_SORTANDFILTER, ...); the vendor preference is Veyra's, because
-// a machine can carry several vendors' MFTs and only one has the hardware.)
-bool listHardwareMfts(bool hevc,uint32_t adapterVendorId,std::vector<MftCandidate>& candidates,std::wstring& detail){
-    MFT_REGISTER_TYPE_INFO inputInfo{MFMediaType_Video,MFVideoFormat_NV12};
-    MFT_REGISTER_TYPE_INFO outputInfo{MFMediaType_Video,hevc?MFVideoFormat_HEVC:MFVideoFormat_H264};
+// All hardware MFTs that accept NV12 (8-bit SDR) or P010 (10-bit HDR) input and
+// produce the requested codec, ordered so the active adapter's own vendor comes first.
+bool listHardwareMfts(bool hevc,bool hdr,uint32_t adapterVendorId,std::vector<MftCandidate>& candidates,std::wstring& detail){
+    MFT_REGISTER_TYPE_INFO inputInfo{MFMediaType_Video,hdr?MFVideoFormat_P010:MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO outputInfo{MFMediaType_Video,(hevc||hdr)?MFVideoFormat_HEVC:MFVideoFormat_H264};
     IMFActivate** activates=nullptr;UINT32 count=0;
     const HRESULT listed=MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,MFT_ENUM_FLAG_HARDWARE|MFT_ENUM_FLAG_SORTANDFILTER,&inputInfo,&outputInfo,&activates,&count);
     if(FAILED(listed)){detail=L"系统编码器枚举失败";log::error("mf-encoder",std::format("MFTEnumEx failed hr={}",hrName(listed)));return false;}
     if(count==0){
-        detail=hevc?L"系统里没有可用的 HEVC 硬件编码器":L"系统里没有可用的 H.264 硬件编码器";
-        log::warn("mf-encoder","no hardware MFT for the requested codec");CoTaskMemFree(activates);return false;
+        detail=hdr?L"系统里没有可用的 HEVC 10bit (P010) 硬件编码器":hevc?L"系统里没有可用的 HEVC 硬件编码器":L"系统里没有可用的 H.264 硬件编码器";
+        log::warn("mf-encoder",hdr?"no hardware P010 HEVC MFT for HDR export":"no hardware MFT for the requested codec");CoTaskMemFree(activates);return false;
     }
     const auto keyword=vendorKeyword(adapterVendorId);
     for(UINT32 index=0;index<count;++index){
         const auto name=attributeString(activates[index],MFT_FRIENDLY_NAME_Attribute);
-        log::info("mf-encoder",std::format("candidate[{}] {} nv12->{} vendorMatch={}",index,narrowUtf8(name),hevc?"HEVC":"H264",containsFold(name,keyword)));
+        log::info("mf-encoder",std::format("candidate[{}] {} {}->{} vendorMatch={}",index,narrowUtf8(name),hdr?"p010":"nv12",(hevc||hdr)?"HEVC":"H264",containsFold(name,keyword)));
         MftCandidate candidate;candidate.name=name;
         activates[index]->QueryInterface(IID_PPV_ARGS(&candidate.activate));
         if(candidate.activate)candidates.push_back(std::move(candidate));
@@ -170,7 +167,8 @@ public:
     EncoderBackend backend() const override {return EncoderBackend::MediaFoundation;}
     std::wstring lastError() const override {return error_;}
     std::wstring describe() const override {
-        return hevc_?std::format(L"系统硬件编码 HEVC（{}）",friendly_):std::format(L"系统硬件编码 H.264（{}）",friendly_);
+        return hdr_?std::format(L"系统硬件编码 HEVC 10bit HDR（{}）",friendly_):
+               hevc_?std::format(L"系统硬件编码 HEVC（{}）",friendly_):std::format(L"系统硬件编码 H.264（{}）",friendly_);
     }
 
 private:
@@ -204,6 +202,7 @@ private:
     std::wstring error_;
     bool check(HRESULT hr,const wchar_t* stage){if(SUCCEEDED(hr))return true;error_=std::format(L"{} HRESULT=0x{:08X}",stage,unsigned(hr));log::error("mf-encoder",narrowUtf8(error_));return false;}
     bool hevc_=false;
+    bool hdr_=false;
     uint32_t bitrateMbps_=0;
     ExportRateControl rateControl_=ExportRateControl::Cq;
     uint32_t drainTimeoutMs_=10000;
@@ -227,36 +226,32 @@ private:
 
 bool MfVideoEncoder::open(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,EnhanceGraph& graph,const EncoderConfig& config,PacketWriter writer){
     ctx_=&ctx;ring_=&ring;graph_=&graph;writer_=std::move(writer);
-    hevc_=config.hevc;bitrateMbps_=config.bitrateMbps;rateControl_=config.rateControl;
+    hdr_=graph.hdrOutput();
+    hevc_=config.hevc||hdr_;bitrateMbps_=config.bitrateMbps;rateControl_=config.rateControl;
     drainTimeoutMs_=config.drainTimeoutMs?config.drainTimeoutMs:10000;
     fpsNum_=std::max(1u,config.fpsNum);fpsDen_=std::max(1u,config.fpsDen);
     width_=graph.workWidth();height_=graph.workHeight();
     error_=L"Media Foundation startup failed; see worker log";
-    if(graph.hdrOutput()){
-        // The MFT path is 8-bit 4:2:0 only; producing an SDR file from an HDR
-        // source without telling the user would be a silent quality lie.
-        log::error("mf-encoder","HDR export requires NVENC (HEVC Main10); Media Foundation path refused");
-        error_=L"HDR 10bit 不支持此系统编码路径（仅 8bit NV12）";
-        return false;
-    }
     if(width_<16||height_<16||(width_&1)||(height_&1)){
-        log::error("mf-encoder",std::format("unsupported extent {}x{} for NV12",width_,height_));
-        error_=std::format(L"Unsupported NV12 extent {}x{}",width_,height_);
+        log::error("mf-encoder",std::format("unsupported extent {}x{} for {}",width_,height_,hdr_?"P010":"NV12"));
+        error_=std::format(L"Unsupported {} extent {}x{}",hdr_?L"P010":L"NV12",width_,height_);
         return false;
     }
     if(!openTransform(config))return false;
-    // Same NV12 conversion the NVENC path uses; the result is read back because
-    // MFTs take system-memory NV12 (no shared D3D12 texture contract).
+    // Same NV12/P010 conversion shader (RgbToNv12.dxil) the NVENC path uses;
+    // the result is read back because MFTs take system-memory NV12/P010.
     std::vector<uint8_t> shader;
     error_=L"RgbToNv12 shader load/create failed";
     if(!convert_.loadShader("RgbToNv12.dxil",shader)||!convert_.create(ctx.device(),shader,kOutputPoolSlots+2,1,2))return false;
     for(unsigned i=0;i<kOutputPoolSlots;++i)makeSrv(ctx.device(),i<2?graph.videoFrameResource(i):graph.generatedFrameResource(i-2),graph.outputFormat(),cpuHandleOf(convert_,i));
-    error_=L"NV12 conversion/readback allocation failed";
-    y_=makeTexture(ctx.device(),width_,height_,DXGI_FORMAT_R8_UNORM,true);
-    uv_=makeTexture(ctx.device(),width_/2,height_/2,DXGI_FORMAT_R8G8_UNORM,true);
+    error_=hdr_?L"P010 conversion/readback allocation failed":L"NV12 conversion/readback allocation failed";
+    const DXGI_FORMAT yFmt=hdr_?DXGI_FORMAT_R16_UNORM:DXGI_FORMAT_R8_UNORM;
+    const DXGI_FORMAT uvFmt=hdr_?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R8G8_UNORM;
+    y_=makeTexture(ctx.device(),width_,height_,yFmt,true);
+    uv_=makeTexture(ctx.device(),width_/2,height_/2,uvFmt,true);
     if(!y_||!uv_)return false;
-    makeUav(ctx.device(),y_.Get(),DXGI_FORMAT_R8_UNORM,cpuHandleOf(convert_,kOutputPoolSlots));
-    makeUav(ctx.device(),uv_.Get(),DXGI_FORMAT_R8G8_UNORM,cpuHandleOf(convert_,kOutputPoolSlots+1));
+    makeUav(ctx.device(),y_.Get(),yFmt,cpuHandleOf(convert_,kOutputPoolSlots));
+    makeUav(ctx.device(),uv_.Get(),uvFmt,cpuHandleOf(convert_,kOutputPoolSlots+1));
     auto makeReadback=[&](uint32_t rows,uint32_t rowBytes,ComPtr<ID3D12Resource>& out,UINT& pitch){
         pitch=alignUp(rowBytes,256);
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;
@@ -264,8 +259,9 @@ bool MfVideoEncoder::open(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& rin
         bd.Height=1;bd.DepthOrArraySize=1;bd.MipLevels=1;bd.SampleDesc.Count=1;bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         return SUCCEEDED(ctx.device()->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&bd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&out)));
     };
-    if(!makeReadback(height_,width_,yRead_,yPitch_)||!makeReadback(height_/2,width_,uvRead_,uvPitch_))return false;
-    packed_.resize(size_t(width_)*height_+size_t(width_)*(height_/2));
+    const uint32_t rowBytes=width_*(hdr_?2u:1u);
+    if(!makeReadback(height_,rowBytes,yRead_,yPitch_)||!makeReadback(height_/2,rowBytes,uvRead_,uvPitch_))return false;
+    packed_.resize(size_t(rowBytes)*height_+size_t(rowBytes)*(height_/2));
     fenceEvent_=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!fenceEvent_){error_=std::format(L"CreateEvent win32={}",GetLastError());return false;}
     if(!check(transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH,0),L"Flush"))return false;
@@ -280,7 +276,7 @@ bool MfVideoEncoder::openTransform(const EncoderConfig& config){
     if(!acquireMediaFoundation())return false;
     mfAcquired_=true;
     std::vector<MftCandidate> candidates;std::wstring detail;
-    if(!listHardwareMfts(hevc_,config.adapterVendorId,candidates,detail)){
+    if(!listHardwareMfts(hevc_,hdr_,config.adapterVendorId,candidates,detail)){
         error_=detail;
         log::error("mf-encoder",std::format("no hardware MFT: {}",narrowUtf8(detail)));
         return false;
@@ -374,10 +370,17 @@ bool MfVideoEncoder::applyRateControl(){
 
 bool MfVideoEncoder::setupTypes(){
     const auto frameRate=[&](IMFMediaType* type){
-        return type->SetUINT64(MF_MT_FRAME_SIZE,(uint64_t(width_)<<32)|height_)==S_OK
+        bool ok=type->SetUINT64(MF_MT_FRAME_SIZE,(uint64_t(width_)<<32)|height_)==S_OK
             &&type->SetUINT64(MF_MT_FRAME_RATE,(uint64_t(fpsNum_)<<32)|fpsDen_)==S_OK
             &&type->SetUINT32(MF_MT_INTERLACE_MODE,MFVideoInterlace_Progressive)==S_OK
             &&type->SetUINT64(MF_MT_PIXEL_ASPECT_RATIO,(uint64_t(1)<<32)|1)==S_OK;
+        if(ok&&hdr_){
+            type->SetUINT32(MF_MT_VIDEO_PRIMARIES,MFVideoPrimaries_BT2020);
+            type->SetUINT32(MF_MT_TRANSFER_FUNCTION,MFVideoTransFunc_2084);
+            type->SetUINT32(MF_MT_YUV_MATRIX,MFVideoTransferMatrix_BT2020_10);
+            type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,MFNominalRange_16_235);
+        }
+        return ok;
     };
     bool needInput=true,needOutput=true;
     for(int round=0;round<3&&(needInput||needOutput);++round){
@@ -385,9 +388,9 @@ bool MfVideoEncoder::setupTypes(){
             ComPtr<IMFMediaType> output;
             if(SUCCEEDED(MFCreateMediaType(&output))&&output){
                 output->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video);
-                output->SetGUID(MF_MT_SUBTYPE,hevc_?MFVideoFormat_HEVC:MFVideoFormat_H264);
+                output->SetGUID(MF_MT_SUBTYPE,(hevc_||hdr_)?MFVideoFormat_HEVC:MFVideoFormat_H264);
                 output->SetUINT32(MF_MT_AVG_BITRATE,bitrateMbps_>0?bitrateMbps_*1000000u:(hevc_?20000000u:16000000u));
-                output->SetUINT32(MF_MT_MPEG2_PROFILE,hevc_?eAVEncH265VProfile_Main_420_8:eAVEncH264VProfile_High);
+                output->SetUINT32(MF_MT_MPEG2_PROFILE,hdr_?eAVEncH265VProfile_Main_420_10:hevc_?eAVEncH265VProfile_Main_420_8:eAVEncH264VProfile_High);
                 frameRate(output.Get());
                 const HRESULT hr=transform_->SetOutputType(outputId_,output.Get(),0);
                 if(SUCCEEDED(hr)){outputType_=output;needOutput=false;}
@@ -398,6 +401,7 @@ bool MfVideoEncoder::setupTypes(){
                     ComPtr<IMFMediaType> advertised;
                     if(SUCCEEDED(transform_->GetOutputAvailableType(outputId_,0,&advertised))&&advertised){
                         advertised->SetUINT32(MF_MT_AVG_BITRATE,bitrateMbps_>0?bitrateMbps_*1000000u:(hevc_?20000000u:16000000u));
+                        if(hdr_)advertised->SetUINT32(MF_MT_MPEG2_PROFILE,eAVEncH265VProfile_Main_420_10);
                         frameRate(advertised.Get());
                         const HRESULT retry=transform_->SetOutputType(outputId_,advertised.Get(),0);
                         if(SUCCEEDED(retry)){outputType_=advertised;needOutput=false;}
@@ -410,19 +414,27 @@ bool MfVideoEncoder::setupTypes(){
             ComPtr<IMFMediaType> input;
             if(SUCCEEDED(MFCreateMediaType(&input))&&input){
                 input->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video);
-                input->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12);
+                input->SetGUID(MF_MT_SUBTYPE,hdr_?MFVideoFormat_P010:MFVideoFormat_NV12);
+                input->SetUINT32(MF_MT_DEFAULT_STRIDE,width_*(hdr_?2u:1u));
                 frameRate(input.Get());
                 const HRESULT hr=transform_->SetInputType(inputId_,input.Get(),0);
                 if(SUCCEEDED(hr)){inputType_=input;needInput=false;}
                 else if(hr==MF_E_TRANSFORM_TYPE_NOT_SET){log::info("mf-encoder","input type needs the output type first");}
                 else{
-                    ComPtr<IMFMediaType> advertised;
-                    if(SUCCEEDED(transform_->GetInputAvailableType(inputId_,0,&advertised))&&advertised){
+                    // Scan advertised input types for the exact requested subtype (P010 or NV12).
+                    const GUID wantedSubtype=hdr_?MFVideoFormat_P010:MFVideoFormat_NV12;
+                    HRESULT retry=hr;
+                    for(DWORD typeIndex=0;needInput;++typeIndex){
+                        ComPtr<IMFMediaType> advertised;
+                        if(FAILED(transform_->GetInputAvailableType(inputId_,typeIndex,&advertised))||!advertised)break;
+                        GUID subtype{};
+                        if(FAILED(advertised->GetGUID(MF_MT_SUBTYPE,&subtype))||subtype!=wantedSubtype)continue;
+                        advertised->SetUINT32(MF_MT_DEFAULT_STRIDE,width_*(hdr_?2u:1u));
                         frameRate(advertised.Get());
-                        const HRESULT retry=transform_->SetInputType(inputId_,advertised.Get(),0);
-                        if(SUCCEEDED(retry)){inputType_=advertised;needInput=false;}
-                        else log::error("mf-encoder",std::format("SetInputType failed hr={} retry={}",hrName(hr),hrName(retry)));
-                    }else log::error("mf-encoder",std::format("SetInputType failed hr={} and no advertised type",hrName(hr)));
+                        retry=transform_->SetInputType(inputId_,advertised.Get(),0);
+                        if(SUCCEEDED(retry)){inputType_=advertised;needInput=false;break;}
+                    }
+                    if(needInput)log::error("mf-encoder",std::format("SetInputType failed hr={} retry={} hdr={}",hrName(hr),hrName(retry),hdr_));
                 }
             }
         }
@@ -589,10 +601,10 @@ bool MfVideoEncoder::convertToNv12(unsigned frameSlot,bool generated){
     states_.transition(list,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     states_.transition(list,y_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     states_.transition(list,uv_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // reserved.y = output dither step (see NvencD3D12Encoder): the Media
-    // Foundation encoder must dither a graded frame exactly like the NVENC path
-    // so preview/export stay consistent.
-    const float dims[8]={std::bit_cast<float>(width_),std::bit_cast<float>(height_),0,std::bit_cast<float>(graph_?graph_->outputDitherStep():0.0f),0,0,0,0};
+    // reserved.x = HDR/PQ mode (0 SDR NV12, 1 linear FP16->PQ P010, 2 HDR10->P010),
+    // reserved.y = output dither step (see NvencD3D12Encoder).
+    const uint32_t hdrFlag=hdr_?(graph_&&graph_->hdr10Output()?2u:1u):0u;
+    const float dims[8]={std::bit_cast<float>(width_),std::bit_cast<float>(height_),std::bit_cast<float>(hdrFlag),std::bit_cast<float>(graph_?graph_->outputDitherStep():0.0f),0,0,0,0};
     convert_.bind(list,dims,gpuHandleOf(convert_,frameSlot+(generated?2:0)).ptr,gpuHandleOf(convert_,kOutputPoolSlots).ptr);
     list->Dispatch((width_+15)/16,(height_+15)/16,1);
     states_.uavBarrier(list,y_.Get());
@@ -625,15 +637,16 @@ bool MfVideoEncoder::convertToNv12(unsigned frameSlot,bool generated){
             return false;
         }
     }
+    const uint32_t rowBytes=width_*(hdr_?2u:1u);
     for(unsigned plane=0;plane<2;++plane){
         void* mapped=nullptr;
         ID3D12Resource* resource=plane?uvRead_.Get():yRead_.Get();
         const UINT pitch=plane?uvPitch_:yPitch_;
         const uint32_t rows=plane?height_/2:height_;
         if(FAILED(resource->Map(0,nullptr,&mapped)))return false;
-        uint8_t* destination=plane?packed_.data()+size_t(width_)*height_:packed_.data();
+        uint8_t* destination=plane?packed_.data()+size_t(rowBytes)*height_:packed_.data();
         for(uint32_t row=0;row<rows;++row){
-            std::memcpy(destination+size_t(row)*width_,static_cast<const uint8_t*>(mapped)+size_t(row)*pitch,width_);
+            std::memcpy(destination+size_t(row)*rowBytes,static_cast<const uint8_t*>(mapped)+size_t(row)*pitch,rowBytes);
         }
         resource->Unmap(0,nullptr);
     }
@@ -700,7 +713,7 @@ bool MfVideoEncoder::submitSample(IMFSample* sample){
 
 bool MfVideoEncoder::openLive(uint32_t width,uint32_t height,const EncoderConfig& config,PacketWriter writer){
     writer_=std::move(writer);liveTimestamps_=true;
-    hevc_=config.hevc;bitrateMbps_=config.bitrateMbps;rateControl_=config.rateControl;
+    hdr_=false;hevc_=config.hevc;bitrateMbps_=config.bitrateMbps;rateControl_=config.rateControl;
     drainTimeoutMs_=config.drainTimeoutMs?config.drainTimeoutMs:10000;
     fpsNum_=std::max(1u,config.fpsNum);fpsDen_=std::max(1u,config.fpsDen);
     width_=width;height_=height;
