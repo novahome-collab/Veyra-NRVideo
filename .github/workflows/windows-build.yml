@@ -178,6 +178,7 @@ jobs:
           cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components veyra_effect_availability_tests veyra_repair_contract_tests veyra_video_ai_settings_tests
           $shaders = ninja -C C:\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
           if ($shaders) { cmake --build C:\b --parallel --target @shaders }
+          $env:PATH = "C:\v\installed\x64-windows\bin;C:\dovi\bin;$env:PATH"
           & C:\b\veyra_effect_availability_tests.exe
           if ($LASTEXITCODE -ne 0) { throw "veyra_effect_availability_tests failed ($LASTEXITCODE)" }
           & C:\b\veyra_repair_contract_tests.exe
